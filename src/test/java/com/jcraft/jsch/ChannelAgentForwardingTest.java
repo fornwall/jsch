@@ -1,11 +1,13 @@
 package com.jcraft.jsch;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Vector;
 import org.junit.jupiter.api.Test;
@@ -19,7 +21,9 @@ class ChannelAgentForwardingTest {
   private static final byte SSH2_AGENTC_REQUEST_IDENTITIES = 11;
   private static final byte SSH2_AGENT_IDENTITIES_ANSWER = 12;
   private static final byte SSH2_AGENTC_SIGN_REQUEST = 13;
+  private static final byte SSH2_AGENT_SIGN_RESPONSE = 14;
   private static final byte SSH2_AGENTC_ADD_IDENTITY = 17;
+  private static final byte SSH2_AGENTC_REMOVE_IDENTITY = 18;
   private static final byte SSH2_AGENTC_EXTENSION = 27;
   private static final byte SSH2_AGENT_FAILURE = 30;
   private static final byte UNKNOWN_REQUEST = 99;
@@ -66,9 +70,13 @@ class ChannelAgentForwardingTest {
     return chunk;
   }
 
-  /** An identity repository that records the blob every {@code add} was handed. */
+  /**
+   * An identity repository that records the blob every {@code add} and {@code remove} was handed.
+   */
   static class RecordingRepository implements IdentityRepository {
     final List<byte[]> added = new ArrayList<>();
+    final List<byte[]> removed = new ArrayList<>();
+    final Vector<Identity> identities = new Vector<>();
 
     @Override
     public String getName() {
@@ -82,7 +90,7 @@ class ChannelAgentForwardingTest {
 
     @Override
     public Vector<Identity> getIdentities() {
-      return new Vector<>();
+      return identities;
     }
 
     @Override
@@ -93,11 +101,58 @@ class ChannelAgentForwardingTest {
 
     @Override
     public boolean remove(byte[] blob) {
+      removed.add(blob);
       return true;
     }
 
     @Override
     public void removeAll() {}
+  }
+
+  /** An identity that signs anything, and records what it was asked to sign. */
+  static class RecordingIdentity implements Identity {
+    static final byte[] SIGNATURE = Util.str2byte("a signature");
+
+    final byte[] blob;
+    final List<byte[]> signed = new ArrayList<>();
+
+    RecordingIdentity(byte[] blob) {
+      this.blob = blob;
+    }
+
+    @Override
+    public boolean setPassphrase(byte[] passphrase) {
+      return true;
+    }
+
+    @Override
+    public byte[] getPublicKeyBlob() {
+      return blob;
+    }
+
+    @Override
+    public byte[] getSignature(byte[] data) {
+      signed.add(data);
+      return SIGNATURE;
+    }
+
+    @Override
+    public String getAlgName() {
+      return "ssh-ed25519";
+    }
+
+    @Override
+    public String getName() {
+      return "recording identity";
+    }
+
+    @Override
+    public boolean isEncrypted() {
+      return false;
+    }
+
+    @Override
+    public void clear() {}
   }
 
   /** Prefixes {@code body} with its length, giving one complete agent message. */
@@ -133,10 +188,15 @@ class ChannelAgentForwardingTest {
 
   /** A signature request for a key no repository here holds, so the answer is a failure. */
   private static byte[] signRequest() {
-    Buffer body = new Buffer(512);
+    return signRequest(Util.str2byte("public key blob of a key nobody has"),
+        Util.str2byte("data to be signed"));
+  }
+
+  private static byte[] signRequest(byte[] blob, byte[] data) {
+    Buffer body = new Buffer(13 + blob.length + data.length);
     body.putByte(SSH2_AGENTC_SIGN_REQUEST);
-    body.putString(Util.str2byte("public key blob of a key nobody has"));
-    body.putString(Util.str2byte("data to be signed"));
+    body.putString(blob);
+    body.putString(data);
     body.putInt(0); // flags
     return framed(body);
   }
@@ -395,6 +455,158 @@ class ChannelAgentForwardingTest {
 
     assertFalse(channel.isClosed(), "exactly the cap is not too many");
     assertEquals(ChannelAgentForwarding.MAX_MESSAGES_PER_PACKET, session.sent.size());
+    assertEquals(0, channel.rbuf.getLength());
+  }
+
+  @Test
+  void aTruncatedSignRequestDoesNotRunOffTheEndOfTheBuffer() throws Exception {
+    RecordingSession session = new RecordingSession();
+    RecordingRepository repository = new RecordingRepository();
+    session.setIdentityRepository(repository);
+    ChannelAgentForwarding channel = newChannel(session);
+
+    // One well-formed message first. Dispatching it moves the read position and compaction moves
+    // what is left over to the front, but neither erases the bytes behind them: the backing array
+    // still holds this key blob after the reply has gone out.
+    byte[] payload = new byte[100];
+    Arrays.fill(payload, (byte) 0xff);
+    byte[] add = addIdentity(payload);
+    channel.write(add, 0, add.length);
+    assertEquals(1, session.sent.size());
+
+    // The reported case: a sign request whose declared length is one byte, so it consists of its
+    // type and nothing else. getString() reads a four byte length prefix that is not part of this
+    // message -- here 0xffffffff, left behind by the add above -- and then tries to read that many
+    // bytes, which runs past the end of the array and throws out of write().
+    byte[] truncated = bare(SSH2_AGENTC_SIGN_REQUEST);
+    assertDoesNotThrow(() -> channel.write(truncated, 0, truncated.length),
+        "write() runs on the session read loop; it must not throw at a malformed message");
+
+    assertFalse(channel.isClosed(), "a malformed message must not take the channel down");
+    assertEquals(2, session.sent.size(), "the malformed request must still be answered");
+    assertArrayEquals(new byte[] {SSH_AGENT_FAILURE}, session.sent.get(1));
+    assertEquals(0, channel.rbuf.getLength());
+  }
+
+  @Test
+  void aTruncatedSignRequestDoesNotConsumeTheRequestBehindIt() throws Exception {
+    RecordingSession session = new RecordingSession();
+    RecordingRepository repository = new RecordingRepository();
+    session.setIdentityRepository(repository);
+    ChannelAgentForwarding channel = newChannel(session);
+
+    // The bytes an unbounded getString() reaches for here are the next message's length prefix and
+    // type, so the sign request is answered from a request that is not its own.
+    byte[] chunk = concat(bare(SSH2_AGENTC_SIGN_REQUEST), bare(SSH2_AGENTC_REQUEST_IDENTITIES));
+    assertDoesNotThrow(() -> channel.write(chunk, 0, chunk.length));
+
+    assertFalse(channel.isClosed());
+    assertEquals(2, session.sent.size());
+    assertArrayEquals(new byte[] {SSH_AGENT_FAILURE}, session.sent.get(0),
+        "a sign request with no key blob in it is malformed, not a key that cannot be found");
+    assertEquals(SSH2_AGENT_IDENTITIES_ANSWER, session.sent.get(1)[0],
+        "the request behind it must still be answered");
+    assertEquals(0, channel.rbuf.getLength());
+  }
+
+  @Test
+  void aTruncatedRemoveIdentityDoesNotTakeTheKeyOfTheMessageBehindIt() throws Exception {
+    RecordingSession session = new RecordingSession();
+    RecordingRepository repository = new RecordingRepository();
+    session.setIdentityRepository(repository);
+    ChannelAgentForwarding channel = newChannel(session);
+
+    byte[] chunk = concat(bare(SSH2_AGENTC_REMOVE_IDENTITY), bare(SSH2_AGENTC_REQUEST_IDENTITIES));
+    assertDoesNotThrow(() -> channel.write(chunk, 0, chunk.length));
+
+    assertFalse(channel.isClosed());
+    assertEquals(0, repository.removed.size(),
+        "a request that carries no key blob asked the repository to remove a key");
+    assertEquals(2, session.sent.size());
+    assertArrayEquals(new byte[] {SSH_AGENT_FAILURE}, session.sent.get(0),
+        "nothing was removed, so the answer cannot be a success");
+    assertEquals(SSH2_AGENT_IDENTITIES_ANSWER, session.sent.get(1)[0],
+        "the request behind it must still be answered");
+    assertEquals(0, channel.rbuf.getLength());
+  }
+
+  @Test
+  void aTruncatedAddIdentityIsNotHandedToTheRepository() throws Exception {
+    RecordingSession session = new RecordingSession();
+    RecordingRepository repository = new RecordingRepository();
+    session.setIdentityRepository(repository);
+    ChannelAgentForwarding channel = newChannel(session);
+
+    byte[] chunk = concat(bare(SSH2_AGENTC_ADD_IDENTITY), bare(SSH2_AGENTC_REQUEST_IDENTITIES));
+    assertDoesNotThrow(() -> channel.write(chunk, 0, chunk.length));
+
+    assertFalse(channel.isClosed());
+    assertEquals(0, repository.added.size(),
+        "an add-identity with no key in it was still offered to the repository");
+    assertEquals(2, session.sent.size());
+    assertArrayEquals(new byte[] {SSH_AGENT_FAILURE}, session.sent.get(0),
+        "nothing was added, so the answer cannot be a success");
+    assertEquals(SSH2_AGENT_IDENTITIES_ANSWER, session.sent.get(1)[0],
+        "the request behind it must still be answered");
+    assertEquals(0, channel.rbuf.getLength());
+  }
+
+  @Test
+  void aRunOfMalformedMessagesLeavesTheChannelUsable() throws Exception {
+    RecordingSession session = new RecordingSession();
+    RecordingRepository repository = new RecordingRepository();
+    session.setIdentityRepository(repository);
+    ChannelAgentForwarding channel = newChannel(session);
+
+    // Every handler that reads a payload, truncated to its type byte, and then a well-formed
+    // request behind them. None of the three may end the channel, and the fourth must be answered
+    // as if the other three had not been there.
+    byte[] chunk = concat(bare(SSH2_AGENTC_SIGN_REQUEST), bare(SSH2_AGENTC_REMOVE_IDENTITY),
+        bare(SSH2_AGENTC_ADD_IDENTITY), signRequest());
+    assertDoesNotThrow(() -> channel.write(chunk, 0, chunk.length));
+
+    assertFalse(channel.isClosed(), "the channel must survive a run of malformed messages");
+    assertEquals(4, session.sent.size());
+    assertArrayEquals(new byte[] {SSH_AGENT_FAILURE}, session.sent.get(0));
+    assertArrayEquals(new byte[] {SSH_AGENT_FAILURE}, session.sent.get(1));
+    assertArrayEquals(new byte[] {SSH_AGENT_FAILURE}, session.sent.get(2));
+    assertEquals(SSH2_AGENT_FAILURE, session.sent.get(3)[0],
+        "the well-formed sign request behind them names a key nobody holds");
+    assertEquals(0, repository.added.size());
+    assertEquals(0, repository.removed.size());
+    assertEquals(0, channel.rbuf.getLength());
+  }
+
+  @Test
+  void aWellFormedSignRequestIsStillSignedByteForByte() throws Exception {
+    RecordingSession session = new RecordingSession();
+    RecordingRepository repository = new RecordingRepository();
+    // A real public key blob shape: the sign handler reads the key type back out of it.
+    Buffer key = new Buffer(64);
+    key.putString(Util.str2byte("ssh-ed25519"));
+    key.putString(new byte[32]);
+    byte[] blob = Arrays.copyOf(key.buffer, key.index);
+    RecordingIdentity identity = new RecordingIdentity(blob);
+    repository.identities.add(identity);
+    session.setIdentityRepository(repository);
+    ChannelAgentForwarding channel = newChannel(session);
+
+    // A malformed message ahead of it, so this also shows the guard leaves no residue behind.
+    byte[] data = Util.str2byte("the exact bytes the peer wants signed");
+    byte[] chunk = concat(bare(SSH2_AGENTC_SIGN_REQUEST), signRequest(blob, data));
+    assertDoesNotThrow(() -> channel.write(chunk, 0, chunk.length));
+
+    assertFalse(channel.isClosed());
+    assertEquals(2, session.sent.size());
+    assertArrayEquals(new byte[] {SSH_AGENT_FAILURE}, session.sent.get(0));
+
+    assertEquals(1, identity.signed.size(), "the well-formed request should have been signed");
+    assertArrayEquals(data, identity.signed.get(0),
+        "the identity must be handed this message's data and nothing else");
+
+    Buffer answer = new Buffer(session.sent.get(1));
+    assertEquals(SSH2_AGENT_SIGN_RESPONSE, (byte) answer.getByte());
+    assertArrayEquals(RecordingIdentity.SIGNATURE, answer.getString());
     assertEquals(0, channel.rbuf.getLength());
   }
 }
