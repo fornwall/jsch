@@ -1926,6 +1926,12 @@ public class Session {
   Runnable thread;
 
   void run() {
+    // Whether a Throwable is on its way up when the finally runs. Only an Error can be, since the
+    // catch below takes every Exception, and the teardown needs to know: an Error of its own must
+    // not replace one that is already propagating, but on the paths where nothing is it must not be
+    // thrown away either.
+    boolean errorPropagating = true;
+
     // Everything the loop needs is set up inside the try, so that the finally below covers it too.
     // A 20 KB Buffer is allocated here, on a thread that is starting under whatever load the
     // session is already carrying, and an Error out of that used to leave run() with isConnected
@@ -2244,6 +2250,7 @@ public class Session {
             throw new IOException("Unknown SSH message type " + msgType);
         }
       }
+      errorPropagating = false;
     } catch (Exception e) {
       if (getLogger().isEnabled(Logger.INFO)) {
         getLogger().log(Logger.INFO,
@@ -2251,6 +2258,7 @@ public class Session {
       }
       // System.err.println("# Session.run");
       // e.printStackTrace();
+      errorPropagating = false;
     } finally {
       // The teardown must happen on every way out of the loop above, not just the ones that end in
       // the catch. An Error -- an OutOfMemoryError, in practice -- is not caught here and is meant
@@ -2265,16 +2273,34 @@ public class Session {
       // kex -- so leaving the flag set here would park the teardown itself, for ever when no
       // timeout is configured, which is the default.
       in_kex = false;
+      Error teardownError = null;
       try {
         disconnect();
-      } catch (NullPointerException e) {
+      } catch (Exception e) {
+        // Swallowed, as it always was. NullPointerException had a clause of its own here with the
+        // same empty body.
         // System.err.println("@1");
         // e.printStackTrace();
-      } catch (Exception e) {
-        // System.err.println("@2");
-        // e.printStackTrace();
+      } catch (Error e) {
+        // The teardown itself allocates -- the channel list copy here, a Buffer in Channel.close()
+        // -- and the Throwable that brought us here is an OutOfMemoryError in practice, so the heap
+        // it needs may still be exhausted. Hold the Error rather than let it out of the finally:
+        // isConnected still has to be cleared below, and Java discards rather than suppresses a
+        // Throwable replaced from a finally, so letting it out here would take the one that
+        // actually killed the session with it.
+        //
+        // Clearing isConnected before disconnect() instead would not work -- disconnect() returns
+        // immediately when the flag is already false, so that would skip the whole teardown.
+        teardownError = e;
       }
       isConnected = false;
+      if (teardownError != null && !errorPropagating) {
+        // Nothing is on its way up to be masked -- the loop ended normally, or its Exception was
+        // caught and logged above -- so there is nothing to protect and no reason to lose this.
+        // Swallowing it unconditionally would leave a session reporting itself cleanly disconnected
+        // while its socket and streams are still open, with nothing said anywhere about why.
+        throw teardownError;
+      }
     }
   }
 

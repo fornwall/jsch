@@ -184,6 +184,62 @@ class SessionRunTeardownTest {
   }
 
   @Test
+  @DisplayName("an Error out of disconnect() itself still clears isConnected, and is not reported")
+  void errorFromTeardown() throws Exception {
+    FailingSession session =
+        new FailingSession(new OutOfMemoryError("from the read loop"), null, false) {
+          @Override
+          public void disconnect() {
+            super.disconnect();
+            // disconnect() allocates, and the heap that the read loop exhausted is still exhausted.
+            throw new OutOfMemoryError("from the teardown");
+          }
+        };
+    markConnected(session);
+    Channel channel = attachChannel(session);
+
+    OutOfMemoryError thrown = assertThrows(OutOfMemoryError.class, session::run);
+
+    // The teardown's own failure must not stand in for the one that killed the session: Java
+    // discards, not suppresses, a Throwable replaced from a finally, so the caller would otherwise
+    // be left with an allocation stack trace and no sign of the original.
+    assertEquals("from the read loop", thrown.getMessage(),
+        "the teardown's own Error must not replace the one on its way up");
+    assertEquals(1, session.disconnectCount, "disconnect() must still have been attempted");
+    assertFalse(session.isConnected(),
+        "isConnected must be cleared even when disconnect() fails with an Error");
+    assertFalse(channel.isConnected(),
+        "the work disconnect() did before it failed must not be undone");
+  }
+
+  @Test
+  @DisplayName("an Error out of disconnect() with nothing else on its way up is still reported")
+  void errorFromTeardownOnly() throws Exception {
+    // The other side of the case above. There the teardown's Error had to give way to the one that
+    // killed the read loop; here the loop ended normally, so nothing is propagating, and swallowing
+    // it anyway would leave a session that reports itself cleanly disconnected while its socket and
+    // streams are still open -- with no exception and nothing logged to say so.
+    FailingSession session = new FailingSession(null, null, true) {
+      @Override
+      public void disconnect() {
+        super.disconnect();
+        throw new OutOfMemoryError("from the teardown");
+      }
+    };
+    markConnected(session);
+    Channel channel = attachChannel(session);
+
+    OutOfMemoryError thrown = assertThrows(OutOfMemoryError.class, session::run);
+
+    assertEquals("from the teardown", thrown.getMessage(),
+        "a teardown Error with nothing to mask must reach the caller");
+    assertEquals(1, session.disconnectCount, "disconnect() must run exactly once");
+    assertFalse(session.isConnected(), "isConnected must be cleared before the Error is rethrown");
+    assertFalse(channel.isConnected(),
+        "the work disconnect() did before it failed must not be undone");
+  }
+
+  @Test
   @DisplayName("a normal loop exit tears the session down too, not just the failing ones")
   void normalLoopExit() throws Exception {
     // The plain fall-off-the-end exit: nothing is thrown, so the catch is never entered and the
