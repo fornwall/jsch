@@ -89,6 +89,31 @@ class ChannelAgentForwarding extends Channel {
   /** Config key overriding {@link #MAX_MESSAGE_LENGTH}. */
   static final String MAX_MESSAGE_LENGTH_KEY = "max_agent_forwarding_message_length";
 
+  /**
+   * Upper bound on the number of agent messages answered from a single
+   * {@code SSH_MSG_CHANNEL_DATA}.
+   *
+   * <p>
+   * A cap is needed because {@link #write(byte[], int, int)} runs on the session's read loop, and
+   * every reply goes out through {@code Session#write(Packet, Channel, int)}, which waits for the
+   * remote window when the channel has no room. Waiting there is already awkward for one reply --
+   * the window adjustment that would release it can only be read by the thread that is waiting --
+   * and draining turns one such wait per packet into as many as {@code lmpsize / 5}, the smallest
+   * message being a four byte length and a type byte. Signature requests make the same point
+   * without any window involved: they are the one handler that does real work, and a packet full of
+   * them is a packet full of private key operations for every other channel on the connection to
+   * wait behind.
+   *
+   * <p>
+   * 64 is far above what a real peer produces. The agent protocol is request/response and OpenSSH
+   * issues one request at a time; the pipelining seen in practice is a
+   * {@code session-bind@openssh.com} riding along with the request that follows it, so two. A peer
+   * that sends a sixty-fifth message in one packet is not doing request/response, and it is refused
+   * rather than left buffered: leaving it buffered is the very stall this drain loop exists to
+   * remove.
+   */
+  static final int MAX_MESSAGES_PER_PACKET = 64;
+
   Buffer rbuf = null;
   private Buffer wbuf = null;
   private Packet packet = null;
@@ -160,22 +185,47 @@ class ChannelAgentForwarding extends Channel {
 
     rbuf.putByte(foo, s, l);
 
-    if (rbuf.getLength() < 4) {
-      // The length prefix itself has not arrived yet.
-      return;
+    // Answer every complete message the buffer now holds, not only the first. A peer is free to
+    // pipeline, and one that did used to get its second request answered only when unrelated data
+    // happened to arrive behind it, or not at all.
+    int dispatched = 0;
+    while (rbuf.getLength() >= 4) {
+      int mlen = rbuf.getInt();
+      if (mlen < 1 || mlen > maxlen) {
+        refuse(_session, "agent forwarding: message length " + (mlen & 0xffffffffL)
+            + " is outside 1.." + maxlen);
+        return;
+      }
+      if (mlen > rbuf.getLength()) {
+        // Only part of this message has arrived: put the length prefix back and wait for more.
+        rbuf.s -= 4;
+        break;
+      }
+      if (dispatched == MAX_MESSAGES_PER_PACKET) {
+        refuse(_session,
+            "agent forwarding: more than " + MAX_MESSAGES_PER_PACKET + " messages in one packet");
+        return;
+      }
+
+      // Fix where this message ends before handing it over, and consume exactly that much
+      // afterwards: a handler that reads too little must not leave a tail behind, and one that
+      // reads too much must not swallow the message behind it.
+      int end = rbuf.s + mlen;
+      dispatch(_session, mlen);
+      rbuf.s = end;
+      dispatched++;
     }
 
-    int mlen = rbuf.getInt();
-    if (mlen < 1 || mlen > maxlen) {
-      refuse(_session,
-          "agent forwarding: message length " + (mlen & 0xffffffffL) + " is outside 1.." + maxlen);
-      return;
+    // Once, after the loop rather than after every message: shifting per message would copy the
+    // rest of the pipeline down the buffer each time, and would move the bytes the loop is still
+    // indexing. Either way rbuf.s is 0 on return, which is what the checks above assume.
+    if (dispatched > 0) {
+      compact();
     }
-    if (mlen > rbuf.getLength()) {
-      rbuf.s -= 4;
-      return;
-    }
+  }
 
+  /** Answers the one complete message of {@code mlen} bytes that starts at {@code rbuf.s}. */
+  private void dispatch(Session _session, int mlen) {
     int typ = rbuf.getByte();
 
     IdentityRepository irepo = _session.getIdentityRepository();
@@ -290,21 +340,24 @@ class ChannelAgentForwarding extends Channel {
       irepo.removeAll();
       mbuf.putByte(SSH_AGENT_SUCCESS);
     } else if (typ == SSH2_AGENTC_ADD_IDENTITY) {
-      int fooo = rbuf.getLength();
+      // This message's payload and no more: rbuf may already hold the request behind it, and
+      // handing those bytes to the repository as part of the key blob is not a way to add a key.
+      int fooo = mlen - 1;
       byte[] tmp = new byte[fooo];
       rbuf.getByte(tmp);
       boolean result = irepo.add(tmp);
       mbuf.putByte(result ? SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE);
     } else {
-      rbuf.s += rbuf.getLength();
+      // Reached in practice and not only in theory: OpenSSH sends session-bind@openssh.com as
+      // SSH2_AGENTC_EXTENSION, a type this agent does not implement. Skipping the rest of the
+      // buffer here is what used to destroy whatever was pipelined behind such a message; the
+      // caller consumes this message's bytes, so there is nothing to skip.
       mbuf.putByte(SSH_AGENT_FAILURE);
     }
 
     byte[] response = new byte[mbuf.getLength()];
     mbuf.getByte(response);
     send(response);
-
-    compact();
   }
 
   /**
