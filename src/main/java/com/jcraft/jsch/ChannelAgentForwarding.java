@@ -211,7 +211,11 @@ class ChannelAgentForwarding extends Channel {
       // afterwards: a handler that reads too little must not leave a tail behind, and one that
       // reads too much must not swallow the message behind it.
       int end = rbuf.s + mlen;
-      dispatch(_session, mlen);
+      try {
+        dispatch(_session, end);
+      } catch (MalformedMessageException e) {
+        fail(_session, e.getMessage());
+      }
       rbuf.s = end;
       dispatched++;
     }
@@ -224,8 +228,24 @@ class ChannelAgentForwarding extends Channel {
     }
   }
 
-  /** Answers the one complete message of {@code mlen} bytes that starts at {@code rbuf.s}. */
-  private void dispatch(Session _session, int mlen) {
+  /**
+   * Answers the one complete message that runs from {@code rbuf.s} up to, but not including,
+   * {@code end}.
+   *
+   * <p>
+   * Every read of a payload here goes through {@link #getString(int)} or {@link #getInt(int)} and
+   * is refused at {@code end}, so a handler cannot see the message behind this one, and cannot see
+   * the bytes of an earlier message either -- {@link #compact()} moves the read position, it does
+   * not erase what has been read. Reading past {@code end} used to be possible in both directions,
+   * because {@link Buffer} tracks no end of message and its own accessors bound nothing:
+   * {@link Buffer#getByte()} indexes the backing array, {@link Buffer#getString()} takes any length
+   * up to 256 KiB and hands it to {@code System.arraycopy}. What is inside the array comes back as
+   * a key blob or a signature payload; what is past the end of the array throws.
+   *
+   * @throws MalformedMessageException if the message does not contain the fields its type calls for
+   */
+  private void dispatch(Session _session, int end) throws MalformedMessageException {
+    // Safe unguarded: the caller has already refused a message length below 1.
     int typ = rbuf.getByte();
 
     IdentityRepository irepo = _session.getIdentityRepository();
@@ -257,9 +277,9 @@ class ChannelAgentForwarding extends Channel {
       mbuf.putByte(SSH_AGENT_RSA_IDENTITIES_ANSWER);
       mbuf.putInt(0);
     } else if (typ == SSH2_AGENTC_SIGN_REQUEST) {
-      byte[] blob = rbuf.getString();
-      byte[] data = rbuf.getString();
-      int flags = rbuf.getInt();
+      byte[] blob = getString(end);
+      byte[] data = getString(end);
+      int flags = getInt(end);
 
       // if((flags & SSH_AGENT_OLD_SIGNATURE)!=0){ // old OpenSSH 2.0, 2.1
       // datafellows = SSH_BUG_SIGBLOB;
@@ -331,7 +351,7 @@ class ChannelAgentForwarding extends Channel {
         mbuf.putString(signature);
       }
     } else if (typ == SSH2_AGENTC_REMOVE_IDENTITY) {
-      byte[] blob = rbuf.getString();
+      byte[] blob = getString(end);
       irepo.remove(blob);
       mbuf.putByte(SSH_AGENT_SUCCESS);
     } else if (typ == SSH_AGENTC_REMOVE_ALL_RSA_IDENTITIES) {
@@ -342,7 +362,12 @@ class ChannelAgentForwarding extends Channel {
     } else if (typ == SSH2_AGENTC_ADD_IDENTITY) {
       // This message's payload and no more: rbuf may already hold the request behind it, and
       // handing those bytes to the repository as part of the key blob is not a way to add a key.
-      int fooo = mlen - 1;
+      int fooo = end - rbuf.s;
+      if (fooo == 0) {
+        // An add with nothing in it: not something to offer the repository, which is free to be a
+        // proxy for another agent, so an empty key is a message this one would go on to send.
+        throw new MalformedMessageException("an add-identity request with no key in it");
+      }
       byte[] tmp = new byte[fooo];
       rbuf.getByte(tmp);
       boolean result = irepo.add(tmp);
@@ -358,6 +383,59 @@ class ChannelAgentForwarding extends Channel {
     byte[] response = new byte[mbuf.getLength()];
     mbuf.getByte(response);
     send(response);
+  }
+
+  /**
+   * Reads a length prefixed string that lies wholly within the message ending at {@code end}.
+   *
+   * <p>
+   * Unlike {@link Buffer#getString()} this never clamps and never allocates on the strength of a
+   * length it has not checked: the length is measured against what is left of <em>this message</em>
+   * rather than against the backing array or a 256 KiB ceiling, so the array handed back is at most
+   * as long as the message it came out of.
+   *
+   * @throws MalformedMessageException if the string does not fit in what is left of the message
+   */
+  private byte[] getString(int end) throws MalformedMessageException {
+    int len = getInt(end);
+    // len < 0 is a length above 0x7fffffff, which no message this side of the bound can hold.
+    if (len < 0 || len > end - rbuf.s) {
+      throw new MalformedMessageException("wanted a string of " + (len & 0xffffffffL) + " bytes, "
+          + (end - rbuf.s) + " bytes left in the message");
+    }
+    byte[] foo = new byte[len];
+    rbuf.getByte(foo);
+    return foo;
+  }
+
+  /**
+   * Reads a four byte integer that lies wholly within the message ending at {@code end}.
+   *
+   * @throws MalformedMessageException if fewer than four bytes are left in the message
+   */
+  private int getInt(int end) throws MalformedMessageException {
+    if (end - rbuf.s < 4) {
+      throw new MalformedMessageException(
+          "wanted a 4 byte integer, " + (end - rbuf.s) + " bytes left in the message");
+    }
+    return rbuf.getInt();
+  }
+
+  /**
+   * Signals that a message is framed correctly but does not hold the fields its type calls for.
+   *
+   * <p>
+   * A distinct, checked type on purpose. The only thing that answers a peer's message with a
+   * protocol failure should be a fault in that message, and nothing else that a handler can throw
+   * -- a defect here, or an {@link IdentityRepository} of the application's that fails -- is
+   * allowed to arrive dressed as one.
+   */
+  private static class MalformedMessageException extends Exception {
+    private static final long serialVersionUID = -1L;
+
+    MalformedMessageException(String message) {
+      super(message);
+    }
   }
 
   /**
@@ -388,17 +466,46 @@ class ChannelAgentForwarding extends Channel {
       session.getLogger().log(Logger.WARN, reason + ", closing the channel");
     }
 
-    mbuf.reset();
-    mbuf.putByte(SSH_AGENT_FAILURE);
-    byte[] response = new byte[mbuf.getLength()];
-    mbuf.getByte(response);
-    send(response);
+    sendFailure();
 
     rbuf.reset();
     rbuf.buffer = new byte[RBUF_INITIAL_SIZE];
 
     close = true;
     disconnect();
+  }
+
+  /**
+   * Answers a message that is framed correctly but cannot be parsed from its own bytes, and leaves
+   * the channel open.
+   *
+   * <p>
+   * The counterpart of {@link #refuse(Session, String)}, and the distinction is whether the stream
+   * can be picked up again. A bogus length prefix leaves nothing to resynchronise on, so that one
+   * closes; a message whose length is honest and whose contents are not costs its own bytes and no
+   * more, because the caller consumes exactly {@code mlen} either way. Answering and carrying on is
+   * also what OpenSSH's ssh-agent does with a request it cannot parse.
+   *
+   * <p>
+   * Nothing is thrown, for the same reason {@code refuse} throws nothing: this runs on the
+   * session's read loop.
+   */
+  private void fail(Session session, String reason) {
+    if (session.getLogger().isEnabled(Logger.WARN)) {
+      session.getLogger().log(Logger.WARN,
+          "agent forwarding: " + reason + ", answering SSH_AGENT_FAILURE");
+    }
+
+    sendFailure();
+  }
+
+  /** Sends the agent protocol's one byte failure response. */
+  private void sendFailure() {
+    mbuf.reset();
+    mbuf.putByte(SSH_AGENT_FAILURE);
+    byte[] response = new byte[mbuf.getLength()];
+    mbuf.getByte(response);
+    send(response);
   }
 
   private int getMaxMessageLength(Session session) {
