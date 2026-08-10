@@ -85,6 +85,13 @@ class ChannelAgentForwarding extends Channel {
     } catch (Exception e) {
       close = true;
       disconnect();
+    } catch (Throwable e) {
+      // The same cleanup on the Error path, which used to skip it -- and this is the channel the
+      // reported heap exhaustion was driven through, so it is the likeliest one to see an
+      // OutOfMemoryError. Unlike the Exception above the Error is not swallowed.
+      close = true;
+      disconnect();
+      throw e;
     }
   }
 

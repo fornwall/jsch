@@ -88,6 +88,7 @@ public class ChannelDirectTCPIP extends Channel {
   @Override
   void run() {
 
+    boolean loopEnded = false;
     try {
       sendChannelOpen();
 
@@ -113,18 +114,28 @@ public class ChannelDirectTCPIP extends Channel {
           _session.write(packet, this, i);
         }
       }
+      loopEnded = true;
     } catch (Exception e) {
-      // Whenever an exception is thrown by sendChannelOpen(),
-      // 'connected' is false.
+      // Swallowed, as before. The 'connected' fix-up that used to live here is in the finally now.
+    } finally {
+      // From a finally so an Error on its way up cannot skip it. A channel whose run() ends without
+      // disconnect() stays registered on the session with its local socket open. The eof() stays on
+      // the normal-exit path only, as before -- a run that failed has nothing to half-close.
+      //
+      // The fix-up comes first, and has to be here rather than on the Exception path alone:
+      // sendChannelOpen() sets 'connected' on its last line, so anything thrown out of it leaves
+      // the flag false, and Channel.disconnect() returns on its own first line when it is. An Error
+      // out of sendChannelOpen() would otherwise reach a disconnect() that does nothing at all --
+      // the local socket left open and the channel still registered, which is the leak this finally
+      // exists to close.
       if (!connected) {
         connected = true;
       }
+      if (loopEnded) {
+        eof();
+      }
       disconnect();
-      return;
     }
-
-    eof();
-    disconnect();
   }
 
   @Override
