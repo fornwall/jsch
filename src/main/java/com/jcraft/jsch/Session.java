@@ -2218,17 +2218,23 @@ public class Session {
       }
       // System.err.println("# Session.run");
       // e.printStackTrace();
+    } finally {
+      // The teardown must happen on every way out of the loop above, not just the ones that end in
+      // the catch. An Error -- an OutOfMemoryError, in practice -- is not caught here and is meant
+      // to keep propagating, but if it skipped the teardown the transport and the socket would stay
+      // open and the session would keep reporting itself as connected for ever, with no thread left
+      // to notice otherwise.
+      try {
+        disconnect();
+      } catch (NullPointerException e) {
+        // System.err.println("@1");
+        // e.printStackTrace();
+      } catch (Exception e) {
+        // System.err.println("@2");
+        // e.printStackTrace();
+      }
+      isConnected = false;
     }
-    try {
-      disconnect();
-    } catch (NullPointerException e) {
-      // System.err.println("@1");
-      // e.printStackTrace();
-    } catch (Exception e) {
-      // System.err.println("@2");
-      // e.printStackTrace();
-    }
-    isConnected = false;
   }
 
   void delChannel(Channel c) {
