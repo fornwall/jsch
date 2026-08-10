@@ -57,10 +57,45 @@ class ChannelAgentForwarding extends Channel {
   private static final int SSH_AGENT_RSA_SHA2_256 = 0x2;
   private static final int SSH_AGENT_RSA_SHA2_512 = 0x4;
 
-  private Buffer rbuf = null;
+  /** Initial and idle capacity of {@link #rbuf}; the historical size of {@code new Buffer()}. */
+  static final int RBUF_INITIAL_SIZE = 1024 * 10 * 2;
+
+  /**
+   * Default upper bound on the length of a single inbound agent message, in bytes.
+   *
+   * <p>
+   * The requests this channel serves have a small natural ceiling: the largest is an
+   * {@code SSH2_AGENTC_ADD_IDENTITY} carrying a private key, and even a 16384 bit RSA key is only
+   * about 6 KiB of blob, while an {@code SSH2_AGENTC_SIGN_REQUEST} carrying a certificate and the
+   * data to sign is smaller still. 256 KiB therefore leaves a very large margin, and it is the same
+   * ceiling the established agent implementations apply: OpenSSH's ssh-agent
+   * ({@code AGENT_MAX_LEN}), OpenSSH's client side ({@code MAX_AGENT_REPLY_LEN}) and PuTTY's
+   * Pageant ({@code AGENT_MAX_MSGLEN}) all use 256 KiB. It also matches the longest string
+   * {@link Buffer#getString()} will hand back, so a longer message could not be parsed intact here
+   * in any case.
+   *
+   * <p>
+   * A bound is needed because nothing else in the stack provides one: {@code Session#run} reopens
+   * the local window as soon as it falls below half, so the peer decides how much it sends, and
+   * before this bound existed {@link #write(byte[], int, int)} reassembled all of it before the
+   * {@link IdentityRepository} was consulted at all.
+   *
+   * <p>
+   * Override per session with
+   * {@code session.setConfig("max_agent_forwarding_message_length", "...")}.
+   */
+  static final int MAX_MESSAGE_LENGTH = 256 * 1024;
+
+  /** Config key overriding {@link #MAX_MESSAGE_LENGTH}. */
+  static final String MAX_MESSAGE_LENGTH_KEY = "max_agent_forwarding_message_length";
+
+  Buffer rbuf = null;
   private Buffer wbuf = null;
   private Packet packet = null;
   private Buffer mbuf = null;
+
+  /** Resolved lazily from the session config; {@code 0} until then. */
+  private int max_message_length = 0;
 
   ChannelAgentForwarding() {
     super();
@@ -70,7 +105,7 @@ class ChannelAgentForwarding extends Channel {
     lmpsize = LOCAL_MAXIMUM_PACKET_SIZE;
 
     type = Util.str2byte("auth-agent@openssh.com");
-    rbuf = new Buffer();
+    rbuf = new Buffer(RBUF_INITIAL_SIZE);
     rbuf.reset();
     // wbuf=new Buffer(rmpsize);
     // packet=new Packet(wbuf);
@@ -96,28 +131,52 @@ class ChannelAgentForwarding extends Channel {
       packet = new Packet(wbuf);
     }
 
-    if (rbuf.buffer.length < rbuf.index + l) {
-      byte[] newbuf = new byte[rbuf.index + l];
-      System.arraycopy(rbuf.buffer, 0, newbuf, 0, rbuf.buffer.length);
-      rbuf.buffer = newbuf;
-    }
-
-    rbuf.putByte(foo, s, l);
-
-    int mlen = rbuf.getInt();
-    if (mlen > rbuf.getLength()) {
-      rbuf.s -= 4;
-      return;
-    }
-
-    int typ = rbuf.getByte();
-
     Session _session = null;
     try {
       _session = getSession();
     } catch (JSchException e) {
       throw new IOException(e.toString(), e);
     }
+
+    int maxlen = getMaxMessageLength(_session);
+
+    // Refuse before buffering rather than after: the peer chooses how much it sends and the
+    // local window is reopened for it, so this is the only place the reassembly is bounded.
+    if (rbuf.getLength() + l > 4 + maxlen) {
+      refuse(_session, "agent forwarding: " + (rbuf.getLength() + l)
+          + " bytes buffered without a complete message, maximum is " + (4 + maxlen));
+      return;
+    }
+
+    if (rbuf.buffer.length < rbuf.index + l) {
+      int size = rbuf.buffer.length * 2;
+      if (size < rbuf.index + l) {
+        size = rbuf.index + l;
+      }
+      byte[] newbuf = new byte[size];
+      System.arraycopy(rbuf.buffer, 0, newbuf, 0, rbuf.index);
+      rbuf.buffer = newbuf;
+    }
+
+    rbuf.putByte(foo, s, l);
+
+    if (rbuf.getLength() < 4) {
+      // The length prefix itself has not arrived yet.
+      return;
+    }
+
+    int mlen = rbuf.getInt();
+    if (mlen < 1 || mlen > maxlen) {
+      refuse(_session,
+          "agent forwarding: message length " + (mlen & 0xffffffffL) + " is outside 1.." + maxlen);
+      return;
+    }
+    if (mlen > rbuf.getLength()) {
+      rbuf.s -= 4;
+      return;
+    }
+
+    int typ = rbuf.getByte();
 
     IdentityRepository irepo = _session.getIdentityRepository();
     UserInfo userinfo = _session.getUserInfo();
@@ -244,6 +303,72 @@ class ChannelAgentForwarding extends Channel {
     byte[] response = new byte[mbuf.getLength()];
     mbuf.getByte(response);
     send(response);
+
+    compact();
+  }
+
+  /**
+   * Drops the bytes already dispatched and gives back an oversized backing array, so that a
+   * long-lived channel does not hold on to its high-water mark for the rest of the session.
+   */
+  private void compact() {
+    rbuf.shift();
+    if (rbuf.buffer.length > RBUF_INITIAL_SIZE && rbuf.index <= RBUF_INITIAL_SIZE) {
+      byte[] newbuf = new byte[RBUF_INITIAL_SIZE];
+      System.arraycopy(rbuf.buffer, 0, newbuf, 0, rbuf.index);
+      rbuf.buffer = newbuf;
+    }
+  }
+
+  /**
+   * Answers a request that cannot be reassembled with the agent protocol's failure response, and
+   * then closes the channel.
+   *
+   * <p>
+   * A length prefix that is bogus or too large desynchronises the stream, so there is nothing left
+   * to resynchronise on; OpenSSH's ssh-agent closes the connection in the same situation. The
+   * failure response is still sent first, best effort, so a peer waiting for a reply is not left
+   * hanging. Nothing is thrown: this runs on the session's read loop.
+   */
+  private void refuse(Session session, String reason) {
+    if (session.getLogger().isEnabled(Logger.WARN)) {
+      session.getLogger().log(Logger.WARN, reason + ", closing the channel");
+    }
+
+    mbuf.reset();
+    mbuf.putByte(SSH_AGENT_FAILURE);
+    byte[] response = new byte[mbuf.getLength()];
+    mbuf.getByte(response);
+    send(response);
+
+    rbuf.reset();
+    rbuf.buffer = new byte[RBUF_INITIAL_SIZE];
+
+    close = true;
+    disconnect();
+  }
+
+  private int getMaxMessageLength(Session session) {
+    int maxlen = max_message_length;
+    if (maxlen != 0) {
+      return maxlen;
+    }
+
+    maxlen = MAX_MESSAGE_LENGTH;
+    try {
+      String value = session.getConfig(MAX_MESSAGE_LENGTH_KEY);
+      if (value != null) {
+        int configured = Integer.parseInt(value);
+        if (configured > 0) {
+          maxlen = configured;
+        }
+      }
+    } catch (NumberFormatException e) {
+      // keep the default
+    }
+
+    max_message_length = maxlen;
+    return maxlen;
   }
 
   private void send(byte[] message) {
