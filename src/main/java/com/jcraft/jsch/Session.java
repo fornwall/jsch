@@ -715,6 +715,13 @@ public class Session {
     if (in_kex)
       return;
 
+    // Without this a rekey() on a session that is already down would set in_kex and then fail to
+    // send anything, leaving the flag set with no read loop left to ever clear it -- every later
+    // write on the session would park in the kex sleep loop. Same refusal as sendChannelOpen().
+    if (!isConnected) {
+      throw new JSchException("session is down");
+    }
+
     String cipherc2s = getConfig("cipher.c2s");
     String ciphers2c = getConfig("cipher.s2c");
     String[] not_available_ciphers = checkCiphers(getConfig("CheckCiphers"));
@@ -925,7 +932,19 @@ public class Session {
     I_C = new byte[buf.getLength()];
     buf.getByte(I_C);
 
-    write(packet);
+    // in_kex was set above, before the packet was built, so it has to be given back if the KEXINIT
+    // never leaves. The isConnected() check at the top of this method loses to a session that goes
+    // down while the proposal is being assembled, and there is no read loop left to clear the flag
+    // after that.
+    boolean sent = false;
+    try {
+      write(packet);
+      sent = true;
+    } finally {
+      if (!sent) {
+        in_kex = false;
+      }
+    }
 
     if (getLogger().isEnabled(Logger.INFO)) {
       getLogger().log(Logger.INFO, "SSH_MSG_KEXINIT sent");
@@ -2218,7 +2237,6 @@ public class Session {
         }
       }
     } catch (Exception e) {
-      in_kex = false;
       if (getLogger().isEnabled(Logger.INFO)) {
         getLogger().log(Logger.INFO,
             "Caught an exception, leaving main loop due to " + e.getMessage(), e);
@@ -2231,6 +2249,14 @@ public class Session {
       // to keep propagating, but if it skipped the teardown the transport and the socket would stay
       // open and the session would keep reporting itself as connected for ever, with no thread left
       // to notice otherwise.
+      //
+      // Clearing in_kex has to come first, and is why the catch above no longer does it. A key
+      // exchange that was in flight will never finish now, and every write() parks in a sleep loop
+      // while the flag is set. disconnect() closes the channels, and Channel.close() writes an
+      // SSH_MSG_CHANNEL_CLOSE, which is not one of the commands write(Packet) lets through during a
+      // kex -- so leaving the flag set here would park the teardown itself, for ever when no
+      // timeout is configured, which is the default.
+      in_kex = false;
       try {
         disconnect();
       } catch (NullPointerException e) {
