@@ -131,45 +131,57 @@ class ChannelX11 extends Channel {
   @Override
   void run() {
 
+    // The finally covers the whole method, not just the read loop. The socket setup below and the
+    // Buffer after it allocate too -- and that Buffer is rmpsize, the size the server asked for,
+    // which makes it the largest allocation here and the likeliest place to run out of heap. An
+    // Error out of any of it used to leave run() with the channel still registered on the session
+    // and its connection to the local display open.
     try {
-      socket = Util.createSocket(host, port, TIMEOUT);
-      socket.setTcpNoDelay(true);
-      io = new IO();
-      io.setInputStream(socket.getInputStream());
-      io.setOutputStream(socket.getOutputStream());
-      sendOpenConfirmation();
-    } catch (Exception e) {
-      sendOpenFailure(SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
-      close = true;
-      disconnect();
-      return;
-    }
-
-    thread = Thread.currentThread();
-    Buffer buf = new Buffer(rmpsize);
-    Packet packet = new Packet(buf);
-    int i = 0;
-    try {
-      Session _session = getSession();
-      while (thread != null && io != null && io.in != null) {
-        i = io.in.read(buf.buffer, 14, buf.buffer.length - 14 - _session.getBufferMargin());
-        if (i <= 0) {
-          eof();
-          break;
-        }
-        if (close)
-          break;
-        packet.reset();
-        buf.putByte((byte) Session.SSH_MSG_CHANNEL_DATA);
-        buf.putInt(recipient);
-        buf.putInt(i);
-        buf.skip(i);
-        _session.write(packet, this, i);
+      try {
+        socket = Util.createSocket(host, port, TIMEOUT);
+        socket.setTcpNoDelay(true);
+        io = new IO();
+        io.setInputStream(socket.getInputStream());
+        io.setOutputStream(socket.getOutputStream());
+        sendOpenConfirmation();
+      } catch (Exception e) {
+        sendOpenFailure(SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
+        close = true;
+        return;
       }
-    } catch (Exception e) {
-      // System.err.println(e);
+
+      thread = Thread.currentThread();
+      Buffer buf = new Buffer(rmpsize);
+      Packet packet = new Packet(buf);
+      int i = 0;
+      try {
+        Session _session = getSession();
+        while (thread != null && io != null && io.in != null) {
+          i = io.in.read(buf.buffer, 14, buf.buffer.length - 14 - _session.getBufferMargin());
+          if (i <= 0) {
+            eof();
+            break;
+          }
+          if (close)
+            break;
+          packet.reset();
+          buf.putByte((byte) Session.SSH_MSG_CHANNEL_DATA);
+          buf.putInt(recipient);
+          buf.putInt(i);
+          buf.skip(i);
+          _session.write(packet, this, i);
+        }
+      } catch (Exception e) {
+        // System.err.println(e);
+      }
+    } finally {
+      // Session.run() is what starts this thread, and a channel whose run() ends without
+      // disconnect() stays registered on the session with its local socket open, which is the leak
+      // Session.run()'s own teardown was fixed for. The setup path above reaches this the same way
+      // it always did: it sets close and returns, and the disconnect() it used to make itself
+      // happens here.
+      disconnect();
     }
-    disconnect();
   }
 
   private byte[] cache = new byte[0];

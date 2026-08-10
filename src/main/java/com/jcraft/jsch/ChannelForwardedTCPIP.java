@@ -55,65 +55,77 @@ public class ChannelForwardedTCPIP extends Channel {
 
   @Override
   public void run() {
+    // The finally covers the whole method, not just the read loop. The socket setup below and the
+    // Buffer after it allocate too -- and that Buffer is rmpsize, the size the server asked for,
+    // which makes it the largest allocation here and the likeliest place to run out of heap. An
+    // Error out of any of it used to leave run() with the channel still registered on the session
+    // and its local socket open.
     try {
-      if (config instanceof ConfigDaemon) {
-        ConfigDaemon _config = (ConfigDaemon) config;
-        Class<? extends ForwardedTCPIPDaemon> c =
-            Class.forName(_config.target).asSubclass(ForwardedTCPIPDaemon.class);
-        daemon = c.getDeclaredConstructor().newInstance();
+      try {
+        if (config instanceof ConfigDaemon) {
+          ConfigDaemon _config = (ConfigDaemon) config;
+          Class<? extends ForwardedTCPIPDaemon> c =
+              Class.forName(_config.target).asSubclass(ForwardedTCPIPDaemon.class);
+          daemon = c.getDeclaredConstructor().newInstance();
 
-        PipedOutputStream out = new PipedOutputStream();
-        io.setInputStream(new PassiveInputStream(out, 32 * 1024), false);
+          PipedOutputStream out = new PipedOutputStream();
+          io.setInputStream(new PassiveInputStream(out, 32 * 1024), false);
 
-        daemon.setChannel(this, getInputStream(), out);
-        daemon.setArg(_config.arg);
-        getSession().getThreadFactory().newThread(daemon).start();
-      } else {
-        ConfigLHost _config = (ConfigLHost) config;
-        socket =
-            (_config.factory == null) ? Util.createSocket(_config.target, _config.lport, TIMEOUT)
-                : _config.factory.createSocket(_config.target, _config.lport);
-        socket.setTcpNoDelay(true);
-        io.setInputStream(socket.getInputStream());
-        io.setOutputStream(socket.getOutputStream());
-      }
-      sendOpenConfirmation();
-    } catch (Exception e) {
-      sendOpenFailure(SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
-      close = true;
-      disconnect();
-      return;
-    }
-
-    thread = Thread.currentThread();
-    Buffer buf = new Buffer(rmpsize);
-    Packet packet = new Packet(buf);
-    int i = 0;
-    try {
-      Session _session = getSession();
-      while (thread != null && io != null && io.in != null) {
-        i = io.in.read(buf.buffer, 14, buf.buffer.length - 14 - _session.getBufferMargin());
-        if (i <= 0) {
-          eof();
-          break;
+          daemon.setChannel(this, getInputStream(), out);
+          daemon.setArg(_config.arg);
+          getSession().getThreadFactory().newThread(daemon).start();
+        } else {
+          ConfigLHost _config = (ConfigLHost) config;
+          socket =
+              (_config.factory == null) ? Util.createSocket(_config.target, _config.lport, TIMEOUT)
+                  : _config.factory.createSocket(_config.target, _config.lport);
+          socket.setTcpNoDelay(true);
+          io.setInputStream(socket.getInputStream());
+          io.setOutputStream(socket.getOutputStream());
         }
-        packet.reset();
-        buf.putByte((byte) Session.SSH_MSG_CHANNEL_DATA);
-        buf.putInt(recipient);
-        buf.putInt(i);
-        buf.skip(i);
-        synchronized (this) {
-          if (close)
+        sendOpenConfirmation();
+      } catch (Exception e) {
+        sendOpenFailure(SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
+        close = true;
+        return;
+      }
+
+      thread = Thread.currentThread();
+      Buffer buf = new Buffer(rmpsize);
+      Packet packet = new Packet(buf);
+      int i = 0;
+      try {
+        Session _session = getSession();
+        while (thread != null && io != null && io.in != null) {
+          i = io.in.read(buf.buffer, 14, buf.buffer.length - 14 - _session.getBufferMargin());
+          if (i <= 0) {
+            eof();
             break;
-          _session.write(packet, this, i);
+          }
+          packet.reset();
+          buf.putByte((byte) Session.SSH_MSG_CHANNEL_DATA);
+          buf.putInt(recipient);
+          buf.putInt(i);
+          buf.skip(i);
+          synchronized (this) {
+            if (close)
+              break;
+            _session.write(packet, this, i);
+          }
         }
+      } catch (Exception e) {
+        // System.err.println(e);
       }
-    } catch (Exception e) {
-      // System.err.println(e);
+    } finally {
+      // Session.run() is what starts this thread, and a channel whose run() ends without
+      // disconnect() stays registered on the session with its local socket open, which is the leak
+      // Session.run()'s own teardown was fixed for. The setup path above reaches this the same way
+      // it always did: it sets close and returns, and the disconnect() it used to make itself
+      // happens here.
+      // thread=null;
+      // eof();
+      disconnect();
     }
-    // thread=null;
-    // eof();
-    disconnect();
   }
 
   @Override

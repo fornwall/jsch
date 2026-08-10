@@ -715,6 +715,13 @@ public class Session {
     if (in_kex)
       return;
 
+    // Without this a rekey() on a session that is already down would set in_kex and then fail to
+    // send anything, leaving the flag set with no read loop left to ever clear it -- every later
+    // write on the session would park in the kex sleep loop. Same refusal as sendChannelOpen().
+    if (!isConnected) {
+      throw new JSchException("session is down");
+    }
+
     String cipherc2s = getConfig("cipher.c2s");
     String ciphers2c = getConfig("cipher.s2c");
     String[] not_available_ciphers = checkCiphers(getConfig("CheckCiphers"));
@@ -888,44 +895,60 @@ public class Session {
     kex_start_time = System.currentTimeMillis();
     in_kex = true;
 
-    // byte SSH_MSG_KEXINIT(20)
-    // byte[16] cookie (random bytes)
-    // string kex_algorithms
-    // string server_host_key_algorithms
-    // string encryption_algorithms_client_to_server
-    // string encryption_algorithms_server_to_client
-    // string mac_algorithms_client_to_server
-    // string mac_algorithms_server_to_client
-    // string compression_algorithms_client_to_server
-    // string compression_algorithms_server_to_client
-    // string languages_client_to_server
-    // string languages_server_to_client
-    Buffer buf = new Buffer(); // send_kexinit may be invoked
-    Packet packet = new Packet(buf); // by user thread.
-    packet.reset();
-    buf.putByte((byte) SSH_MSG_KEXINIT);
-    synchronized (random) {
-      random.fill(buf.buffer, buf.index, 16);
-      buf.skip(16);
+    // in_kex is armed here, ahead of the proposal it announces, so it has to be given back whenever
+    // the KEXINIT does not leave -- and that includes an OutOfMemoryError out of one of the
+    // allocations below rather than out of the write itself. Only the read loop clears the flag,
+    // from receive_newkeys(), and no NEWKEYS can arrive for a KEXINIT that was never sent: every
+    // later write() would park in write(Packet)'s sleep loop, unbounded when no timeout is
+    // configured, which is the default. The isConnected() check at the top of this method also
+    // loses to a session that goes down while the proposal is being assembled, and there is no read
+    // loop left to clear the flag after that either.
+    boolean sent = false;
+    try {
+      // byte SSH_MSG_KEXINIT(20)
+      // byte[16] cookie (random bytes)
+      // string kex_algorithms
+      // string server_host_key_algorithms
+      // string encryption_algorithms_client_to_server
+      // string encryption_algorithms_server_to_client
+      // string mac_algorithms_client_to_server
+      // string mac_algorithms_server_to_client
+      // string compression_algorithms_client_to_server
+      // string compression_algorithms_server_to_client
+      // string languages_client_to_server
+      // string languages_server_to_client
+      Buffer buf = new Buffer(); // send_kexinit may be invoked
+      Packet packet = new Packet(buf); // by user thread.
+      packet.reset();
+      buf.putByte((byte) SSH_MSG_KEXINIT);
+      synchronized (random) {
+        random.fill(buf.buffer, buf.index, 16);
+        buf.skip(16);
+      }
+      buf.putString(Util.str2byte(kex));
+      buf.putString(Util.str2byte(server_host_key));
+      buf.putString(Util.str2byte(cipherc2s));
+      buf.putString(Util.str2byte(ciphers2c));
+      buf.putString(Util.str2byte(getConfig("mac.c2s")));
+      buf.putString(Util.str2byte(getConfig("mac.s2c")));
+      buf.putString(Util.str2byte(getConfig("compression.c2s")));
+      buf.putString(Util.str2byte(getConfig("compression.s2c")));
+      buf.putString(Util.str2byte(getConfig("lang.c2s")));
+      buf.putString(Util.str2byte(getConfig("lang.s2c")));
+      buf.putByte((byte) 0);
+      buf.putInt(0);
+
+      buf.setOffSet(5);
+      I_C = new byte[buf.getLength()];
+      buf.getByte(I_C);
+
+      write(packet);
+      sent = true;
+    } finally {
+      if (!sent) {
+        in_kex = false;
+      }
     }
-    buf.putString(Util.str2byte(kex));
-    buf.putString(Util.str2byte(server_host_key));
-    buf.putString(Util.str2byte(cipherc2s));
-    buf.putString(Util.str2byte(ciphers2c));
-    buf.putString(Util.str2byte(getConfig("mac.c2s")));
-    buf.putString(Util.str2byte(getConfig("mac.s2c")));
-    buf.putString(Util.str2byte(getConfig("compression.c2s")));
-    buf.putString(Util.str2byte(getConfig("compression.s2c")));
-    buf.putString(Util.str2byte(getConfig("lang.c2s")));
-    buf.putString(Util.str2byte(getConfig("lang.s2c")));
-    buf.putByte((byte) 0);
-    buf.putInt(0);
-
-    buf.setOffSet(5);
-    I_C = new byte[buf.getLength()];
-    buf.getByte(I_C);
-
-    write(packet);
 
     if (getLogger().isEnabled(Logger.INFO)) {
       getLogger().log(Logger.INFO, "SSH_MSG_KEXINIT sent");
@@ -1875,19 +1898,26 @@ public class Session {
     boolean resetSeqo = packet.buffer.getCommand() == SSH_MSG_NEWKEYS && doStrictKex;
 
     synchronized (lock) {
+      // A null io means the transport is gone: the session was disconnected, or its read loop died
+      // and tore it down. Silently dropping the packet and returning tells the caller the write
+      // succeeded, which is how a write on a dead session used to look like a successful one.
+      // Reading io into a local also keeps a concurrent disconnect() from turning the check into a
+      // null dereference a line later.
+      IO _io = io;
+      if (_io == null) {
+        throw new JSchException("session is down");
+      }
       encode(packet);
-      if (io != null) {
-        io.put(packet);
-        if (++seqo == 0 && (enable_strict_kex || require_strict_kex) && initialKex) {
-          throw new JSchStrictKexException("outgoing sequence number wrapped during initial KEX");
-        }
-        if (resetSeqo) {
-          seqo = 0;
-        }
+      _io.put(packet);
+      if (++seqo == 0 && (enable_strict_kex || require_strict_kex) && initialKex) {
+        throw new JSchStrictKexException("outgoing sequence number wrapped during initial KEX");
+      }
+      if (resetSeqo) {
+        seqo = 0;
       }
     }
 
-    if (resetSeqo && io != null && getLogger().isEnabled(Logger.INFO)) {
+    if (resetSeqo && getLogger().isEnabled(Logger.INFO)) {
       getLogger().log(Logger.INFO,
           "Reset outgoing sequence number after sending SSH_MSG_NEWKEYS for strict KEX");
     }
@@ -1896,19 +1926,29 @@ public class Session {
   Runnable thread;
 
   void run() {
-    thread = this::run;
+    // Whether a Throwable is on its way up when the finally runs. Only an Error can be, since the
+    // catch below takes every Exception, and the teardown needs to know: an Error of its own must
+    // not replace one that is already propagating, but on the paths where nothing is it must not be
+    // thrown away either.
+    boolean errorPropagating = true;
 
-    byte[] foo;
-    Buffer buf = new Buffer();
-    Packet packet = new Packet(buf);
-    int i = 0;
-    Channel channel;
-    int[] start = new int[1];
-    int[] length = new int[1];
-    KeyExchange kex = null;
-
-    int stimeout = 0;
+    // Everything the loop needs is set up inside the try, so that the finally below covers it too.
+    // A 20 KB Buffer is allocated here, on a thread that is starting under whatever load the
+    // session is already carrying, and an Error out of that used to leave run() with isConnected
+    // still set, the transport still open and no reader behind it.
     try {
+      thread = this::run;
+
+      byte[] foo;
+      Buffer buf = new Buffer();
+      Packet packet = new Packet(buf);
+      int i = 0;
+      Channel channel;
+      int[] start = new int[1];
+      int[] length = new int[1];
+      KeyExchange kex = null;
+
+      int stimeout = 0;
       while (isConnected && thread != null) {
         try {
           buf = read(buf);
@@ -2210,25 +2250,58 @@ public class Session {
             throw new IOException("Unknown SSH message type " + msgType);
         }
       }
+      errorPropagating = false;
     } catch (Exception e) {
-      in_kex = false;
       if (getLogger().isEnabled(Logger.INFO)) {
         getLogger().log(Logger.INFO,
             "Caught an exception, leaving main loop due to " + e.getMessage(), e);
       }
       // System.err.println("# Session.run");
       // e.printStackTrace();
+      errorPropagating = false;
+    } finally {
+      // The teardown must happen on every way out of the loop above, not just the ones that end in
+      // the catch. An Error -- an OutOfMemoryError, in practice -- is not caught here and is meant
+      // to keep propagating, but if it skipped the teardown the transport and the socket would stay
+      // open and the session would keep reporting itself as connected for ever, with no thread left
+      // to notice otherwise.
+      //
+      // Clearing in_kex has to come first, and is why the catch above no longer does it. A key
+      // exchange that was in flight will never finish now, and every write() parks in a sleep loop
+      // while the flag is set. disconnect() closes the channels, and Channel.close() writes an
+      // SSH_MSG_CHANNEL_CLOSE, which is not one of the commands write(Packet) lets through during a
+      // kex -- so leaving the flag set here would park the teardown itself, for ever when no
+      // timeout is configured, which is the default.
+      in_kex = false;
+      Error teardownError = null;
+      try {
+        disconnect();
+      } catch (Exception e) {
+        // Swallowed, as it always was. NullPointerException had a clause of its own here with the
+        // same empty body.
+        // System.err.println("@1");
+        // e.printStackTrace();
+      } catch (Error e) {
+        // The teardown itself allocates -- the channel list copy here, a Buffer in Channel.close()
+        // -- and the Throwable that brought us here is an OutOfMemoryError in practice, so the heap
+        // it needs may still be exhausted. Hold the Error rather than let it out of the finally:
+        // isConnected still has to be cleared below, and Java discards rather than suppresses a
+        // Throwable replaced from a finally, so letting it out here would take the one that
+        // actually killed the session with it.
+        //
+        // Clearing isConnected before disconnect() instead would not work -- disconnect() returns
+        // immediately when the flag is already false, so that would skip the whole teardown.
+        teardownError = e;
+      }
+      isConnected = false;
+      if (teardownError != null && !errorPropagating) {
+        // Nothing is on its way up to be masked -- the loop ended normally, or its Exception was
+        // caught and logged above -- so there is nothing to protect and no reason to lose this.
+        // Swallowing it unconditionally would leave a session reporting itself cleanly disconnected
+        // while its socket and streams are still open, with nothing said anywhere about why.
+        throw teardownError;
+      }
     }
-    try {
-      disconnect();
-    } catch (NullPointerException e) {
-      // System.err.println("@1");
-      // e.printStackTrace();
-    } catch (Exception e) {
-      // System.err.println("@2");
-      // e.printStackTrace();
-    }
-    isConnected = false;
   }
 
   void delChannel(Channel c) {

@@ -252,14 +252,18 @@ class ChannelSession extends Channel {
     } catch (Exception e) {
       // System.err.println("# ChannelExec.run");
       // e.printStackTrace();
-    }
-    Thread _thread = thread;
-    if (_thread != null) {
-      synchronized (_thread) {
-        _thread.notifyAll();
+    } finally {
+      // From a finally so an Error on its way up cannot skip it. thread == null is what says this
+      // reader has finished -- it is half of run()'s own loop condition -- so an Error that skipped
+      // this left the field pointing at a dead thread until disconnect() got round to clearing it.
+      Thread _thread = thread;
+      if (_thread != null) {
+        synchronized (_thread) {
+          _thread.notifyAll();
+        }
       }
+      thread = null;
     }
-    thread = null;
     // System.err.println(this+":run <");
   }
 }
