@@ -1875,19 +1875,26 @@ public class Session {
     boolean resetSeqo = packet.buffer.getCommand() == SSH_MSG_NEWKEYS && doStrictKex;
 
     synchronized (lock) {
+      // A null io means the transport is gone: the session was disconnected, or its read loop died
+      // and tore it down. Silently dropping the packet and returning tells the caller the write
+      // succeeded, which is how a write on a dead session used to look like a successful one.
+      // Reading io into a local also keeps a concurrent disconnect() from turning the check into a
+      // null dereference a line later.
+      IO _io = io;
+      if (_io == null) {
+        throw new JSchException("session is down");
+      }
       encode(packet);
-      if (io != null) {
-        io.put(packet);
-        if (++seqo == 0 && (enable_strict_kex || require_strict_kex) && initialKex) {
-          throw new JSchStrictKexException("outgoing sequence number wrapped during initial KEX");
-        }
-        if (resetSeqo) {
-          seqo = 0;
-        }
+      _io.put(packet);
+      if (++seqo == 0 && (enable_strict_kex || require_strict_kex) && initialKex) {
+        throw new JSchStrictKexException("outgoing sequence number wrapped during initial KEX");
+      }
+      if (resetSeqo) {
+        seqo = 0;
       }
     }
 
-    if (resetSeqo && io != null && getLogger().isEnabled(Logger.INFO)) {
+    if (resetSeqo && getLogger().isEnabled(Logger.INFO)) {
       getLogger().log(Logger.INFO,
           "Reset outgoing sequence number after sending SSH_MSG_NEWKEYS for strict KEX");
     }
