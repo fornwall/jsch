@@ -27,6 +27,7 @@
 package com.jcraft.jsch;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.Vector;
 
 class ChannelAgentForwarding extends Channel {
@@ -57,10 +58,19 @@ class ChannelAgentForwarding extends Channel {
   private static final int SSH_AGENT_RSA_SHA2_256 = 0x2;
   private static final int SSH_AGENT_RSA_SHA2_512 = 0x4;
 
-  private Buffer rbuf = null;
+  static final int RBUF_INITIAL_SIZE = 1024 * 10 * 2;
+  static final int MAX_MESSAGE_LENGTH = 256 * 1024;
+  static final int MAX_CHANNELS_PER_SESSION = 32;
+  static final int MAX_QUEUED_MESSAGES = 1024;
+  private static final int MAX_QUEUED_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH;
+
+  Buffer rbuf = null;
   private Buffer wbuf = null;
   private Packet packet = null;
   private Buffer mbuf = null;
+  private final ArrayDeque<Buffer> requestQueue = new ArrayDeque<>();
+  private int queuedMessageLength = 0;
+  private boolean requestQueueClosed = false;
 
   ChannelAgentForwarding() {
     super();
@@ -70,7 +80,7 @@ class ChannelAgentForwarding extends Channel {
     lmpsize = LOCAL_MAXIMUM_PACKET_SIZE;
 
     type = Util.str2byte("auth-agent@openssh.com");
-    rbuf = new Buffer();
+    rbuf = new Buffer(RBUF_INITIAL_SIZE);
     rbuf.reset();
     // wbuf=new Buffer(rmpsize);
     // packet=new Packet(wbuf);
@@ -80,47 +90,136 @@ class ChannelAgentForwarding extends Channel {
 
   @Override
   void run() {
+    thread = Thread.currentThread();
+    Session session = null;
     try {
+      session = getSession();
       sendOpenConfirmation();
+      while (thread != null) {
+        Buffer request = takeRequest();
+        if (request == null) {
+          break;
+        }
+        byte[] response;
+        synchronized (session.getAgentForwardingLock()) {
+          if (isClosed()) {
+            break;
+          }
+          response = processMessage(request, session);
+        }
+        send(response);
+      }
     } catch (Exception e) {
-      close = true;
+      // The channel is closed in the finally block.
+    } finally {
+      eof();
       disconnect();
+      if (session != null) {
+        session.agentForwardingWorkerFinished(this);
+      }
     }
   }
 
   @Override
   void write(byte[] foo, int s, int l) throws IOException {
+    while (l > 0) {
+      if (rbuf.index < 4) {
+        int chunk = Math.min(l, 4 - rbuf.index);
+        appendToReadBuffer(foo, s, chunk);
+        s += chunk;
+        l -= chunk;
+        if (rbuf.index < 4) {
+          return;
+        }
+      }
 
-    if (packet == null) {
-      wbuf = new Buffer(rmpsize);
-      packet = new Packet(wbuf);
+      int mlen = getMessageLength();
+      int chunk = Math.min(l, 4 + mlen - rbuf.index);
+      appendToReadBuffer(foo, s, chunk);
+      s += chunk;
+      l -= chunk;
+      if (rbuf.index < 4 + mlen) {
+        return;
+      }
+
+      rbuf.getInt();
+      Buffer request = new Buffer(mlen);
+      request.putByte(rbuf.buffer, rbuf.s, mlen);
+      resetReadBuffer();
+      enqueueRequest(request);
     }
+  }
 
-    if (rbuf.buffer.length < rbuf.index + l) {
-      byte[] newbuf = new byte[rbuf.index + l];
-      System.arraycopy(rbuf.buffer, 0, newbuf, 0, rbuf.buffer.length);
-      rbuf.buffer = newbuf;
+  private void enqueueRequest(Buffer request) throws IOException {
+    synchronized (requestQueue) {
+      if (requestQueueClosed) {
+        throw new IOException("Agent request queue is closed");
+      }
+      if (requestQueue.size() >= MAX_QUEUED_MESSAGES) {
+        throw new IOException("Agent request queue exceeds " + MAX_QUEUED_MESSAGES + " messages");
+      }
+      int length = request.getLength();
+      if (queuedMessageLength > MAX_QUEUED_MESSAGE_LENGTH - length) {
+        throw new IOException(
+            "Agent request queue exceeds " + MAX_QUEUED_MESSAGE_LENGTH + " bytes");
+      }
+      requestQueue.addLast(request);
+      queuedMessageLength += length;
+      requestQueue.notifyAll();
     }
+  }
 
-    rbuf.putByte(foo, s, l);
-
-    int mlen = rbuf.getInt();
-    if (mlen > rbuf.getLength()) {
-      rbuf.s -= 4;
-      return;
+  private Buffer takeRequest() throws InterruptedException {
+    synchronized (requestQueue) {
+      while (requestQueue.isEmpty() && !requestQueueClosed) {
+        requestQueue.wait();
+      }
+      if (requestQueue.isEmpty()) {
+        return null;
+      }
+      Buffer request = requestQueue.removeFirst();
+      queuedMessageLength -= request.getLength();
+      return request;
     }
+  }
 
-    int typ = rbuf.getByte();
-
-    Session _session = null;
-    try {
-      _session = getSession();
-    } catch (JSchException e) {
-      throw new IOException(e.toString(), e);
+  private int getMessageLength() throws IOException {
+    rbuf.rewind();
+    int length = rbuf.getInt();
+    rbuf.rewind();
+    if (length < 1 || length > MAX_MESSAGE_LENGTH) {
+      resetReadBuffer();
+      throw new IOException("Illegal agent message length: " + (length & 0xffffffffL));
     }
+    return length;
+  }
 
-    IdentityRepository irepo = _session.getIdentityRepository();
-    UserInfo userinfo = _session.getUserInfo();
+  private void appendToReadBuffer(byte[] data, int offset, int length) {
+    int required = rbuf.index + length;
+    if (rbuf.buffer.length < required) {
+      int size = Math.min(rbuf.buffer.length * 2, 4 + MAX_MESSAGE_LENGTH);
+      if (size < required) {
+        size = required;
+      }
+      byte[] buffer = new byte[size];
+      System.arraycopy(rbuf.buffer, 0, buffer, 0, rbuf.index);
+      rbuf.buffer = buffer;
+    }
+    rbuf.putByte(data, offset, length);
+  }
+
+  private void resetReadBuffer() {
+    rbuf.reset();
+    if (rbuf.buffer.length > RBUF_INITIAL_SIZE) {
+      rbuf.buffer = new byte[RBUF_INITIAL_SIZE];
+    }
+  }
+
+  private byte[] processMessage(Buffer request, Session session) throws IOException {
+    int typ = request.getByte();
+
+    IdentityRepository irepo = session.getIdentityRepository();
+    UserInfo userinfo = session.getUserInfo();
 
     mbuf.reset();
 
@@ -148,9 +247,9 @@ class ChannelAgentForwarding extends Channel {
       mbuf.putByte(SSH_AGENT_RSA_IDENTITIES_ANSWER);
       mbuf.putInt(0);
     } else if (typ == SSH2_AGENTC_SIGN_REQUEST) {
-      byte[] blob = rbuf.getString();
-      byte[] data = rbuf.getString();
-      int flags = rbuf.getInt();
+      byte[] blob = request.getString();
+      byte[] data = request.getString();
+      int flags = request.getInt();
 
       // if((flags & SSH_AGENT_OLD_SIGNATURE)!=0){ // old OpenSSH 2.0, 2.1
       // datafellows = SSH_BUG_SIGBLOB;
@@ -222,7 +321,7 @@ class ChannelAgentForwarding extends Channel {
         mbuf.putString(signature);
       }
     } else if (typ == SSH2_AGENTC_REMOVE_IDENTITY) {
-      byte[] blob = rbuf.getString();
+      byte[] blob = request.getString();
       irepo.remove(blob);
       mbuf.putByte(SSH_AGENT_SUCCESS);
     } else if (typ == SSH_AGENTC_REMOVE_ALL_RSA_IDENTITIES) {
@@ -231,22 +330,24 @@ class ChannelAgentForwarding extends Channel {
       irepo.removeAll();
       mbuf.putByte(SSH_AGENT_SUCCESS);
     } else if (typ == SSH2_AGENTC_ADD_IDENTITY) {
-      int fooo = rbuf.getLength();
-      byte[] tmp = new byte[fooo];
-      rbuf.getByte(tmp);
-      boolean result = irepo.add(tmp);
+      byte[] identity = new byte[request.getLength()];
+      request.getByte(identity);
+      boolean result = irepo.add(identity);
       mbuf.putByte(result ? SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE);
     } else {
-      rbuf.s += rbuf.getLength();
       mbuf.putByte(SSH_AGENT_FAILURE);
     }
 
     byte[] response = new byte[mbuf.getLength()];
     mbuf.getByte(response);
-    send(response);
+    return response;
   }
 
-  private void send(byte[] message) {
+  private void send(byte[] message) throws IOException {
+    if (packet == null) {
+      wbuf = new Buffer(rmpsize);
+      packet = new Packet(wbuf);
+    }
     packet.reset();
     wbuf.putByte((byte) Session.SSH_MSG_CHANNEL_DATA);
     wbuf.putInt(recipient);
@@ -256,12 +357,27 @@ class ChannelAgentForwarding extends Channel {
     try {
       getSession().write(packet, this, 4 + message.length);
     } catch (Exception e) {
+      throw new IOException(e.toString(), e);
     }
   }
 
   @Override
   void eof_remote() {
     super.eof_remote();
-    eof();
+    synchronized (requestQueue) {
+      requestQueueClosed = true;
+      requestQueue.notifyAll();
+    }
+  }
+
+  @Override
+  public void disconnect() {
+    synchronized (requestQueue) {
+      requestQueueClosed = true;
+      requestQueue.clear();
+      queuedMessageLength = 0;
+      requestQueue.notifyAll();
+    }
+    super.disconnect();
   }
 }

@@ -34,12 +34,14 @@ import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.Hashtable;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -183,6 +185,8 @@ public class Session {
 
   private boolean disconnectingChannels = false;
   private final List<Channel> channels = new ArrayList<>();
+  private final Set<ChannelAgentForwarding> agentForwardingWorkers = new HashSet<>();
+  private final Object agentForwardingLock = new Object();
   private final ReadWriteLock channelsLock = new ReentrantReadWriteLock();
 
   Session(JSch jsch, String username, String host, int port) throws JSchException {
@@ -2939,11 +2943,17 @@ public class Session {
     return addChannel(channel);
   }
 
-  private Channel addChannel(Channel channel) {
+  Channel addChannel(Channel channel) {
     Lock l = channelsLock.writeLock();
     l.lock();
     try {
-      if (!disconnectingChannels && isConnected) {
+      if (!disconnectingChannels && isConnected()) {
+        if (channel instanceof ChannelAgentForwarding) {
+          if (agentForwardingWorkers.size() >= ChannelAgentForwarding.MAX_CHANNELS_PER_SESSION) {
+            return null;
+          }
+          agentForwardingWorkers.add((ChannelAgentForwarding) channel);
+        }
         channel.setSession(this);
         channels.add(channel);
         return channel;
@@ -2953,6 +2963,20 @@ public class Session {
     } finally {
       l.unlock();
     }
+  }
+
+  void agentForwardingWorkerFinished(ChannelAgentForwarding channel) {
+    Lock l = channelsLock.writeLock();
+    l.lock();
+    try {
+      agentForwardingWorkers.remove(channel);
+    } finally {
+      l.unlock();
+    }
+  }
+
+  Object getAgentForwardingLock() {
+    return agentForwardingLock;
   }
 
   String[] getServerSigAlgs() {
